@@ -1,0 +1,322 @@
+---
+title: "VAE creation & fit"
+output: NULL
+---
+
+**This file gives a basic explanation and step-wise running option for the "vae_all.R" file. It parameterizes and constructs a VAE for use in candida albicans colony morphology image analysis**
+
+We begin with a check for proper tensorflow operation, and then a series of source and library calls to get many of the variables and functions we will be working with
+
+```{r}
+if (tensorflow::tf$executing_eagerly())
+  tensorflow::tf$compat$v1$disable_eager_execution()
+
+source("init.R")
+
+require(tcltk)
+library(keras)
+library(bmp)
+library(imager)
+library(tidyverse)
+library(abind)
+library(ggpubr)
+
+K <- keras::backend()
+```
+
+Here are several global variables that define the **experiment number** (for documentation - makes parameter experimentation easier to undertand), **source image path**, **number** or **percentage of images** in each dataset (train/val/test), and **source image dimensions**
+
+```{r}
+exp = "expTest3"
+numba = "_expTest3_"
+thresh = 0.25
+
+all_images_path <- "/home/data/refined/candescence/tlv/0.2-images_cut/all-batch2"
+
+train_num <- 1600
+val_num <- 400
+test_num <- 400
+
+# input image dimensions
+img_rows <- 135L
+img_cols <- 135L
+# color channels (1 = grayscale, 3 = RGB)
+img_chns <- 1L
+```
+
+Create and populate (train/val/test) dataset directories with the cut up images from the source directory.
+
+The use of a seed allows us to populate the directories with the same images as previous attempts if need-be
+
+```{r}
+set.seed(1004)
+# comment out when not in use:
+create_samples(all_images_path, VAES, train_num, val_num, test_num, numba, thresh, pattern = "bmp$|BMP$")
+```
+
+Setting appropriate dataset variables to point to their respective paths
+
+```{r}
+# uppercase these
+train_events <- file.path(VAES, paste0("train",  numba))
+val_events <- file.path(VAES, paste0("val",  numba))
+test_events <- file.path(VAES, paste0("test",  numba, "_", thresh))
+  
+
+keras_model_dir <-  file.path(VAES, "keras_models", exp)
+output <- file.path(VAES, exp)
+```
+
+Next is the function that actually converts each individual image into a tensor (and converts them to greyscale images)
+
+```{r}
+image_tensor <- function( targets ) {
+  tmp <-  lapply(targets, FUN = function(t) {
+    ## potentially use imageR functions to cut cols or rows here before turning into array
+    tmp <- load.image(t)
+    # DO CHECK AND DELETE COLUMN OF ROW IF NECESARY
+    rows <- dim(tmp)[1]
+    cols <- dim(tmp)[2]
+    
+    # print(dim(tmp))
+    if (rows != 135 && cols != 135) {
+      tmp <- imsub(tmp,x<136,y<136)
+    }
+    else if (cols != 135 && rows == 135) {
+      tmp <- imsub(tmp,y<136)
+    }
+    else if (rows != 135 && cols == 135) {
+      tmp <- imsub(tmp,x<136)
+    }
+    # print(dim(tmp))
+    
+    ## Make greyscale 
+    tmp <- add(imsplit(tmp,"c"))
+    # print(dim(tmp))
+    tmp <- as.array(tmp)
+    return( array_reshape(tmp[,,1,1], c(img_rows, img_cols, img_chns), order = "F" ) )
+  }) 
+  return( abind( tmp, along = 0 ))
+}
+```
+
+Use the image_tensor function defined above to create a list of images in tensor form (stored in **x_train, x_val, etc.)**
+
+```{r}
+files_x_train <- list.files(train_events, full.names = TRUE)
+files_x_val <- list.files(val_events, full.names = TRUE)
+
+x_train <- image_tensor( files_x_train )
+x_val  <- image_tensor( files_x_val )
+```
+
+**Parameterization**
+
+Here most of the parameters that could effect convergence, loss, and model performance are defined.
+
+Some other parameters that could effect performance that are not defined right in this very chunk (but rather later on) are:
+
+-   Optimizer function (e.g Adam vs Adadelta vs rmsprop etc.)
+
+-   Stride lengths during convolution
+
+```{r}
+set.seed(1)
+
+
+# number of convolutional filters to use
+filters <- 64L
+
+# convolution kernel size
+num_conv <- 5L
+
+latent_dim <- 2L
+intermediate_dim <-  32L
+epsilon_std <- 1.0
+
+# training parameters
+batch_size <- 100L
+eps <- 10L
+```
+
+Constructing the encoder using a convolutional neural network, in which the images in tensor format are ultimately encoded as some representation in the latent space. This model uses **4 convolutional layers** followed by tensor **flattening** and **concatenation** into a single vector.
+
+```{r}
+original_img_size <- c(img_rows, img_cols, img_chns)
+
+x <- layer_input(shape = c(original_img_size))
+
+conv_1 <- layer_conv_2d(  #conv2d_20
+  x,
+  filters = img_chns, # number of output filters (dimensions) in the convolution
+  kernel_size = c(2L, 2L), # height and width of the convolution window
+  strides = c(1L, 1L), # strides of the convolution along the height and width
+  padding = "same", # same means padding with zeroes evenly around the input (since strides = 1 output same size as input)
+  activation = "relu" # which activation function to use
+)
+
+conv_2 <- layer_conv_2d(  #convd_21
+  conv_1,
+  filters = filters,
+  kernel_size = c(2L, 2L),
+  strides = c(2L, 2L),
+  padding = "same",
+  activation = "relu"
+)
+
+conv_3 <- layer_conv_2d( #convd_22
+  conv_2,
+  filters = filters,
+  kernel_size = c(num_conv, num_conv),
+  strides = c(1L, 1L),
+  padding = "same",
+  activation = "relu"
+)
+
+conv_4 <- layer_conv_2d( #convd_23
+  conv_3,
+  filters = filters,
+  kernel_size = c(num_conv, num_conv),
+  strides = c(1L, 1L),
+  padding = "same",
+  activation = "relu"
+)
+
+flat <- layer_flatten(conv_4)
+hidden <- layer_dense(flat, units = intermediate_dim, activation = "relu")
+
+z_mean <- layer_dense(hidden, units = latent_dim)
+z_log_var <- layer_dense(hidden, units = latent_dim)
+
+sampling <- function(args) {
+  z_mean <- args[, 1:(latent_dim)]
+  z_log_var <- args[, (latent_dim + 1):(2 * latent_dim)]
+  
+  epsilon <- k_random_normal(
+    shape = c(k_shape(z_mean)[[1]]),
+    mean = 0.,
+    stddev = epsilon_std
+  )
+  z_mean + k_exp(z_log_var) * epsilon
+}
+
+z <- layer_concatenate(list(z_mean, z_log_var)) %>% layer_lambda(sampling)
+```
+
+Constructing the decoder portion of the VAE, essentially reversing the encoding process in an attempt to regenerate the original image (with the same dimensions)
+
+**Note:** The model uses a final cropping layer to remove 1 pixel from the height and width of the images to get the output in the correct dimensions (135 x 135 x 1). This MAY DISRUPT EDGE RECOGNITION slightly
+
+```{r}
+output_shape <- c(batch_size, 68L, 68L, filters)
+
+
+decoder_hidden <- layer_dense(units = intermediate_dim, activation = "relu")
+decoder_upsample <- layer_dense(units = prod(output_shape[-1]), activation = "relu")
+
+decoder_reshape <- layer_reshape(target_shape = output_shape[-1])
+decoder_deconv_1 <- layer_conv_2d_transpose(
+  filters = filters,
+  kernel_size = c(num_conv, num_conv),
+  strides = c(1L, 1L),
+  padding = "same",
+  activation = "relu"
+)
+
+decoder_deconv_2 <- layer_conv_2d_transpose(
+  filters = filters,
+  kernel_size = c(num_conv, num_conv),
+  strides = c(1L, 1L),
+  padding = "same",
+  activation = "relu"
+)
+
+decoder_deconv_3_upsample <- layer_conv_2d_transpose(
+  filters = filters,
+  kernel_size = c(3L, 3L),
+  strides = c(2L, 2L),
+  padding = "valid",
+  activation = "relu"
+)
+
+decoder_mean_squash <- layer_conv_2d( # Make it 135 x 135 x 1 by the end
+  filters = img_chns,
+  kernel_size = c(2L, 2L),
+  strides = c(1L, 1L),
+  padding = "valid",
+  activation = "sigmoid"
+)
+
+decoder_mean_squash_crp <- layer_cropping_2d( #added
+  cropping = list(c(1L,0L),c(1L,0L)),
+  data_format= NULL
+)
+
+hidden_decoded <- decoder_hidden(z)
+up_decoded <- decoder_upsample(hidden_decoded)
+reshape_decoded <- decoder_reshape(up_decoded)
+deconv_1_decoded <- decoder_deconv_1(reshape_decoded)
+deconv_2_decoded <- decoder_deconv_2(deconv_1_decoded)
+x_decoded_relu <- decoder_deconv_3_upsample(deconv_2_decoded)
+x_decoded_mean_squash <- decoder_mean_squash(x_decoded_relu)
+x_decoded_mean_squash_crp <- decoder_mean_squash_crp(x_decoded_mean_squash) #added
+```
+
+A function that determines the loss present throughout model training (essentially the difference between the original input images and the output images generated by the decoder)
+
+```{r}
+vae_loss <- function(x, x_decoded_mean_squash_crp) { #remove _crp if wrong
+  beta = 1.0
+  x <- k_flatten(x)
+  x_decoded_mean_squash_crp <- k_flatten(x_decoded_mean_squash_crp)
+  xent_loss <- 1.0 * img_rows * img_cols *
+    loss_binary_crossentropy(x, x_decoded_mean_squash_crp)
+  kl_loss <- -0.5 * k_mean(1 + z_log_var - k_square(z_mean) -
+                             beta* k_exp(z_log_var), axis = -1L)
+  k_mean(xent_loss + kl_loss)
+}
+```
+
+Defining and compiling the VAE itself, with optional lines of code to visualize the model's layers and trainable parameters
+
+```{r}
+vae <- keras_model(x, x_decoded_mean_squash_crp) #changed
+vae %>% compile(optimizer = optimizer_adam(), loss = vae_loss)  # better than rmsprop
+
+# Optional summary and encoder model:
+summary(vae)
+
+## encoder: model to project inputs on the latent space
+encoder <- keras_model(x, z_mean)
+```
+
+```{r}
+## build a digit generator that can sample from the learned distribution
+gen_decoder_input <- layer_input(shape = latent_dim)
+gen_hidden_decoded <- decoder_hidden(gen_decoder_input)
+gen_up_decoded <- decoder_upsample(gen_hidden_decoded)
+gen_reshape_decoded <- decoder_reshape(gen_up_decoded)
+gen_deconv_1_decoded <- decoder_deconv_1(gen_reshape_decoded)
+gen_deconv_2_decoded <- decoder_deconv_2(gen_deconv_1_decoded)
+gen_x_decoded_relu <- decoder_deconv_3_upsample(gen_deconv_2_decoded)
+gen_x_decoded_mean_squash <- decoder_mean_squash(gen_x_decoded_relu)
+generator <- keras_model(gen_decoder_input, gen_x_decoded_mean_squash)
+```
+
+Actual model fitting using a given GPU and the lists of "tensored" images for each dataset (train/val/test) previously created. Also saves that specific model's weights to the same folder containing the dataset directories
+
+```{r}
+with(tensorflow::tf$device('GPU:9'), {
+  vae %>% fit(
+    x_train, x_train, 
+    shuffle = TRUE, 
+    epochs = eps, 
+    batch_size = batch_size, 
+    validation_data = list(x_val, x_val)
+  )
+})
+
+gc()
+
+vae %>% save_model_weights_tf(keras_model_dir)
+```
